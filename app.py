@@ -1,6 +1,8 @@
 import os
 import time
 import re
+import hashlib
+import hmac
 import requests
 from flask import Flask, request, jsonify, Response, redirect, make_response, render_template_string
 from functools import wraps
@@ -10,14 +12,46 @@ app = Flask(__name__)
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 OS_API_KEY = os.environ.get("OS_API_KEY", "")
+TRACKERS_RAW = os.environ.get("TRACKERS", "")
 DEFAULT_FEED_ID = os.environ.get("DEFAULT_FEED_ID", "")
 SESSION_COOKIE = "dofe_session"
 CACHE_SECONDS = 150
 spot_cache = {}
 
+def parse_trackers():
+    raw = TRACKERS_RAW.strip()
+    if not raw and DEFAULT_FEED_ID:
+        raw = f"BOT1={DEFAULT_FEED_ID}"
+
+    items = []
+    seen = set()
+    for part in re.split(r"[;\n\r]+", raw):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, feed = part.split("=", 1)
+        name = name.strip()
+        feed = feed.strip()
+        if not name or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", feed):
+            continue
+        key = hashlib.sha256(feed.encode("utf-8")).hexdigest()[:12]
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({"id": key, "name": name, "feed": feed})
+    return items
+
+def tracker_by_id(tracker_id):
+    for t in parse_trackers():
+        if t["id"] == tracker_id:
+            return t
+    return None
+
+def public_trackers():
+    return [{"id": t["id"], "name": t["name"]} for t in parse_trackers()]
+
 def session_token():
-    import hashlib
-    return hashlib.sha256(("burton-dofe-v10|" + APP_PASSWORD).encode("utf-8")).hexdigest()
+    return hashlib.sha256(("burton-dofe-v11|" + APP_PASSWORD).encode("utf-8")).hexdigest()
 
 def logged_in():
     return request.cookies.get(SESSION_COOKIE) == session_token()
@@ -40,7 +74,6 @@ def health():
 def login():
     if request.method == "POST":
         supplied = request.form.get("password", "")
-        import hmac
         if APP_PASSWORD and hmac.compare_digest(supplied, APP_PASSWORD):
             resp = make_response(redirect("/"))
             resp.set_cookie(
@@ -66,15 +99,21 @@ def logout():
 def index():
     if not APP_PASSWORD or not OS_API_KEY:
         return "Server secrets are not configured.", 500
-    return render_template_string(APP_HTML, default_feed=DEFAULT_FEED_ID)
+    return render_template_string(APP_HTML)
 
-@app.route("/api/spot")
+@app.route("/api/trackers")
 @require_login
-def spot():
-    feed = (request.args.get("feed") or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", feed):
-        return jsonify(error="Invalid or missing SPOT feed ID."), 400
+def api_trackers():
+    return jsonify(public_trackers())
 
+@app.route("/api/spot/<tracker_id>")
+@require_login
+def spot(tracker_id):
+    tracker = tracker_by_id(tracker_id)
+    if not tracker:
+        return jsonify(error="Unknown tracker."), 404
+
+    feed = tracker["feed"]
     now = time.time()
     cached = spot_cache.get(feed)
     if cached and now - cached["time"] < CACHE_SECONDS:
@@ -85,7 +124,7 @@ def spot():
     try:
         r = requests.get(
             url,
-            headers={"Accept": "application/json", "User-Agent": "Burton-DofE-Tracker/10.0"},
+            headers={"Accept": "application/json", "User-Agent": "Burton-DofE-Tracker/11.0"},
             timeout=20,
         )
         if r.status_code != 200:
@@ -175,14 +214,11 @@ aside{overflow:auto;padding:10px;border-right:1px solid #ddd;background:#fff}
 .head{display:flex;justify-content:space-between;gap:8px}.name{font-weight:800}
 .muted{font-size:12px;color:#666}.good{color:#167c31;font-weight:700}.warn{color:#a76300;font-weight:700}.bad{color:#a40000;font-weight:700}
 .marker-label{background:#17202a;color:#fff;border:0;border-radius:5px;font-weight:700}
-.modal{display:none;position:fixed;inset:0;background:#0008;z-index:2000;align-items:center;justify-content:center;padding:15px}
-.modal.show{display:flex}.panel{background:#fff;width:min(680px,96vw);max-height:90vh;overflow:auto;border-radius:12px;padding:16px}
-.row{display:grid;grid-template-columns:1fr 2fr auto;gap:7px;margin:7px 0}.row input{width:100%;padding:9px;border:1px solid #aaa;border-radius:7px}
 @media(max-width:760px){
 header{min-height:54px}main{display:block;height:calc(100% - 54px);position:relative}
 #map{height:100%}
 aside{position:absolute;z-index:1000;left:8px;right:8px;bottom:8px;max-height:38%;border:0;border-radius:12px;box-shadow:0 4px 20px #0005;padding:8px}
-.row{grid-template-columns:1fr}.card{padding:8px;margin-bottom:6px}
+.card{padding:8px;margin-bottom:6px}
 }
 </style>
 </head>
@@ -191,99 +227,64 @@ aside{position:absolute;z-index:1000;left:8px;right:8px;bottom:8px;max-height:38
 <h1>Burton DofE - Live Tracking</h1>
 <div class="controls">
 <button onclick="refreshAll(true)">Refresh</button>
-<button onclick="openSettings()">Trackers</button>
 <button onclick="location.href='/logout'">Log out</button>
 </div>
 </header>
-
 <main>
 <aside>
 <div id="trackerList"></div>
+<div class="card muted">Tracker list is managed centrally in Render. Everyone who logs in sees the same groups.</div>
 <div class="card muted">Tap a group to centre the map. Tap anywhere on the OS map for a 6-figure grid reference.</div>
 </aside>
 <div id="map"></div>
 </main>
-
-<div id="settings" class="modal">
-<div class="panel">
-<h2 style="margin-top:0">Tracker setup</h2>
-<p class="muted">Names and feed IDs are saved on this device.</p>
-<div id="trackerRows"></div>
-<button onclick="addTrackerRow()">+ Add tracker</button>
-<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
-<button onclick="closeSettings()">Cancel</button>
-<button onclick="saveSettings()">Save</button>
-</div>
-</div>
-</div>
-
 <script>
 proj4.defs("EPSG:27700","+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy +towgs84=446.448,-125.157,542.06,0.15,0.247,0.842,-20.489 +units=m +no_defs");
 const crs=new L.Proj.CRS("EPSG:27700",proj4.defs("EPSG:27700"),{resolutions:[896,448,224,112,56,28,14,7,3.5,1.75],origin:[-238375,1376256]});
 const map=L.map("map",{crs,center:[53.135,-1.81],zoom:7,minZoom:0,maxZoom:9});
 L.tileLayer("/os/{z}/{x}/{y}.png",{minZoom:0,maxZoom:9,noWrap:true,attribution:"Contains OS data © Crown copyright and database rights"}).addTo(map);
 
-let layers={},positions={},lastRefresh=0,clickMarker=null;
+let trackers=[],layers={},positions={},lastRefresh=0,clickMarker=null;
 const REFRESH_MS=150000;
-const DEFAULT_FEED={{ default_feed|tojson }};
-const DEFAULT_TRACKERS=DEFAULT_FEED?[{name:"BOT1",feed:DEFAULT_FEED}]:[];
-
-function loadTrackers(){
-try{
-const saved=JSON.parse(localStorage.getItem("dofeTrackersRender")||"null");
-return Array.isArray(saved)&&saved.length?saved:DEFAULT_TRACKERS;
-}catch{return DEFAULT_TRACKERS}
-}
-let trackers=loadTrackers();
 
 function parseMessages(d){
 let m=d?.response?.feedMessageResponse?.messages?.message??d?.response?.feedMessageResponse?.messages??[];
 if(!Array.isArray(m))m=[m];
-return m.filter(x=>x&&isFinite(+x.latitude)&&isFinite(+x.longitude)&&+x.latitude!=-99999&&+x.longitude!=-99999)
-.sort((a,b)=>(+a.unixTime||0)-(+b.unixTime||0));
+return m.filter(x=>x&&isFinite(+x.latitude)&&isFinite(+x.longitude)&&+x.latitude!=-99999&&+x.longitude!=-99999).sort((a,b)=>(+a.unixTime||0)-(+b.unixTime||0));
 }
 function toBNG(lat,lon){let [e,n]=proj4("EPSG:4326","EPSG:27700",[lon,lat]);return[Math.round(e),Math.round(n)]}
 function gridRef(e,n){
 if(e<0||e>=700000||n<0||n>=1300000)return"Outside BNG";
 let a=Math.floor(e/100000),b=Math.floor(n/100000),l1=(19-b)-(19-b)%5+Math.floor((a+10)/5),l2=(19-b)*5%25+a%5;
 if(l1>7)l1++;if(l2>7)l2++;
-return String.fromCharCode(65+l1)+String.fromCharCode(65+l2)+" "+
-String(Math.floor((e%100000)/100)).padStart(3,"0")+" "+
-String(Math.floor((n%100000)/100)).padStart(3,"0");
+return String.fromCharCode(65+l1)+String.fromCharCode(65+l2)+" "+String(Math.floor((e%100000)/100)).padStart(3,"0")+" "+String(Math.floor((n%100000)/100)).padStart(3,"0");
 }
 function localTime(s){return new Date(s).toLocaleString("en-GB",{dateStyle:"medium",timeStyle:"short",timeZone:"Europe/London"})}
-function statusInfo(s){
-let a=Math.max(0,(Date.now()-new Date(s).getTime())/60000);
-return a>30?{cls:"bad",text:"Stale"}:a>15?{cls:"warn",text:"Delayed"}:{cls:"good",text:"Current"};
-}
+function statusInfo(s){let a=Math.max(0,(Date.now()-new Date(s).getTime())/60000);return a>30?{cls:"bad",text:"Stale"}:a>15?{cls:"warn",text:"Delayed"}:{cls:"good",text:"Current"}}
 function ensureLayer(k){if(!layers[k])layers[k]=L.layerGroup().addTo(map);return layers[k]}
-
 function renderTracker(t,d){
 const m=parseMessages(d);if(!m.length)throw Error("No valid SPOT positions");
-const layer=ensureLayer(t.feed);layer.clearLayers();
+const layer=ensureLayer(t.id);layer.clearLayers();
 const pts=m.map(x=>[+x.latitude,+x.longitude]);
 L.polyline(pts,{weight:3,opacity:.65}).addTo(layer);
 const x=m.at(-1),lat=+x.latitude,lon=+x.longitude,[e,n]=toBNG(lat,lon),g=gridRef(e,n);
-L.marker([lat,lon]).bindTooltip(t.name,{permanent:true,direction:"top",className:"marker-label",offset:[0,-12]})
-.bindPopup("<b>"+esc(t.name)+"</b><br>"+localTime(x.dateTime)+"<br><b>"+g+"</b><br>Altitude: "+(x.altitude??"—")+" m<br>Battery: "+(x.batteryState??"—")).addTo(layer);
-positions[t.feed]={lat,lon,latest:x,grid:g,count:m.length};
+L.marker([lat,lon]).bindTooltip(t.name,{permanent:true,direction:"top",className:"marker-label",offset:[0,-12]}).bindPopup("<b>"+esc(t.name)+"</b><br>"+localTime(x.dateTime)+"<br><b>"+g+"</b><br>Altitude: "+(x.altitude??"—")+" m<br>Battery: "+(x.batteryState??"—")).addTo(layer);
+positions[t.id]={lat,lon,latest:x,grid:g,count:m.length};
 }
+async function loadTrackers(){const r=await fetch("/api/trackers",{cache:"no-store"});if(!r.ok)throw Error("Could not load tracker list");trackers=await r.json()}
 async function loadOne(t){
 try{
-const r=await fetch("/api/spot?feed="+encodeURIComponent(t.feed),{cache:"no-store"});
+const r=await fetch("/api/spot/"+encodeURIComponent(t.id),{cache:"no-store"});
 const d=await r.json();
 if(!r.ok||d.error)throw Error(d.error||("HTTP "+r.status));
 renderTracker(t,d);
-}catch(e){positions[t.feed]={error:e.message}}
+}catch(e){positions[t.id]={error:e.message}}
 }
 function renderList(){
 const h=document.getElementById("trackerList");h.innerHTML="";
-if(!trackers.length){
-h.innerHTML='<div class="card"><b>No trackers configured</b><div class="muted">Tap Trackers above to add one.</div></div>';
-return;
-}
+if(!trackers.length){h.innerHTML='<div class="card"><b>No trackers configured</b><div class="muted">Add the TRACKERS environment variable in Render.</div></div>';return}
 trackers.forEach(t=>{
-const p=positions[t.feed],c=document.createElement("div");c.className="card tracker-card";
+const p=positions[t.id],c=document.createElement("div");c.className="card tracker-card";
 if(!p)c.innerHTML='<div class="head"><span class="name">'+esc(t.name)+'</span><span class="muted">Loading…</span></div>';
 else if(p.error)c.innerHTML='<div class="head"><span class="name">'+esc(t.name)+'</span><span class="bad">Problem</span></div><div class="muted">'+esc(p.error)+'</div>';
 else{
@@ -296,10 +297,11 @@ h.appendChild(c);
 }
 async function refreshAll(force=false){
 if(!force&&Date.now()-lastRefresh<REFRESH_MS)return;
+if(!trackers.length){try{await loadTrackers()}catch(e){document.getElementById("trackerList").innerHTML='<div class="card bad">'+esc(e.message)+'</div>';return}}
 renderList();
 await Promise.all(trackers.map(loadOne));
 renderList();lastRefresh=Date.now();
-const b=trackers.map(t=>positions[t.feed]).filter(p=>p&&!p.error).map(p=>[p.lat,p.lon]);
+const b=trackers.map(t=>positions[t.id]).filter(p=>p&&!p.error).map(p=>[p.lat,p.lon]);
 if(b.length===1)map.setView(b[0],8);else if(b.length>1)map.fitBounds(b,{padding:[35,35],maxZoom:8});
 }
 map.on("click",e=>{
@@ -308,25 +310,7 @@ if(clickMarker)map.removeLayer(clickMarker);
 clickMarker=L.marker(e.latlng).addTo(map).bindPopup('<b style="font-size:19px">'+g+'</b><br><br><button onclick="clearClickMarker()">Clear marker</button>').openPopup();
 });
 function clearClickMarker(){if(clickMarker){map.removeLayer(clickMarker);clickMarker=null}}
-function openSettings(){
-const h=document.getElementById("trackerRows");h.innerHTML="";
-trackers.forEach(t=>addTrackerRow(t.name,t.feed));
-document.getElementById("settings").classList.add("show");
-}
-function closeSettings(){document.getElementById("settings").classList.remove("show")}
-function addTrackerRow(name="",feed=""){
-const r=document.createElement("div");r.className="row";
-r.innerHTML='<input class="name" placeholder="Group name" value="'+attr(name)+'"><input class="feed" placeholder="SPOT feed ID" value="'+attr(feed)+'"><button onclick="this.parentElement.remove()">Remove</button>';
-document.getElementById("trackerRows").appendChild(r);
-}
-function saveSettings(){
-const n=[...document.querySelectorAll("#trackerRows .row")].map(r=>({name:r.querySelector(".name").value.trim(),feed:r.querySelector(".feed").value.trim()})).filter(x=>x.name&&x.feed);
-trackers=n;localStorage.setItem("dofeTrackersRender",JSON.stringify(n));
-Object.values(layers).forEach(l=>map.removeLayer(l));layers={};positions={};
-closeSettings();refreshAll(true);
-}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]))}
-function attr(s){return esc(s)}
 renderList();refreshAll(true);setInterval(()=>refreshAll(false),REFRESH_MS);
 </script>
 </body>
