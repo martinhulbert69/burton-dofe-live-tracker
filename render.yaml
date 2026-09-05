@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: burton-dofe-live-tracker
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    healthCheckPath: /health
+    envVars:
+      - key: APP_PASSWORD
+        sync: false
+      - key: OS_API_KEY
+        sync: false
+      - key: DEFAULT_FEED_ID
+        sync: false
